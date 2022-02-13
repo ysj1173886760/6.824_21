@@ -7,9 +7,12 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
+
+const BufferSize = 1000
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +21,28 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	PUT		int = 0
+	APPEND	int = 1
+	GET		int = 2
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type	int
+	Value	string
+	Key		string
+
+	// who is response to respond this request
+	ID 		int
+}
+
+type Entry struct {
+	putAppendReply		*PutAppendReply
+	getReply			*GetReply
+	term 				int
 }
 
 type KVServer struct {
@@ -35,15 +55,123 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db					map[string]string
+	currentCommitIndex	int
+
+	cicularBuffer		[BufferSize]Entry
 }
 
+func (kv *KVServer) executor() {
+	for kv.killed() == false {
+		msg := <- kv.applyCh
+
+		kv.mu.Lock()
+		command := msg.Command.(Op)
+		if msg.CommandValid {
+			switch command.Type {
+			case GET:
+				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].getReply
+				value, appear := kv.db[command.Key]
+				if command.ID == kv.me {
+					if !appear {
+						reply.Err = ErrNoKey
+					} else {
+						reply.Err = OK
+						reply.Value = value
+					}
+				}
+			case APPEND:
+				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].putAppendReply
+				value, appear := kv.db[command.Key]
+				if !appear {
+					kv.db[command.Key] = command.Value
+				} else {
+					kv.db[command.Key] = value + command.Value
+				}
+				if command.ID == kv.me {
+					reply.Err = OK
+				}
+			case PUT:
+				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].putAppendReply
+				kv.db[command.Key] = command.Value
+				if command.ID == kv.me {
+					reply.Err = OK
+				}
+			}
+		}
+		kv.currentCommitIndex = msg.CommandIndex
+		kv.mu.Unlock()
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	command := Op{ Type: GET, Key: args.Key, ID: kv.me}
+	index, term, isLeader := kv.rf.Start(command)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// put the reply variable into buffer
+	kv.mu.Lock()
+	DPrintf("[%d] fill cicularBuffer, index=%d", kv.me, index % BufferSize)
+	kv.cicularBuffer[index % BufferSize].getReply = reply
+	kv.mu.Unlock()
+
+	for kv.killed() == false {
+		time.Sleep(time.Millisecond * 10)
+		kv.mu.Lock()
+		currentCommitIndex := kv.currentCommitIndex
+		kv.mu.Unlock()
+		if currentCommitIndex >= index {
+			break;
+		}
+	}
+
+	// check Am I still the leader
+	new_term, new_leader := kv.rf.GetState()
+	if new_term != term || new_leader == false {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	command := Op{ Type: args.Type, Key: args.Key, Value: args.Value, ID: kv.me }
+	index, term, isLeader := kv.rf.Start(command)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// put the reply variable into buffer
+	kv.mu.Lock()
+	DPrintf("[%d] fill cicularBuffer, index=%d", kv.me, index % BufferSize)
+	kv.cicularBuffer[index % BufferSize].putAppendReply = reply
+	kv.mu.Unlock()
+
+	for kv.killed() == false {
+		time.Sleep(time.Millisecond * 10)
+		kv.mu.Lock()
+		currentCommitIndex := kv.currentCommitIndex
+		kv.mu.Unlock()
+		if currentCommitIndex >= index {
+			break;
+		}
+	}
+
+	// check Am I still the leader
+	new_term, new_leader := kv.rf.GetState()
+	if new_term != term || new_leader == false {
+		reply.Err = ErrWrongLeader
+		return
+	}
 }
 
 //
@@ -96,6 +224,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.currentCommitIndex = 0
+	kv.db = make(map[string]string)
+
+	go kv.executor()
 
 	return kv
 }

@@ -38,7 +38,33 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
+	args := GetArgs{}
+
+	args.Key = key
+
+	n := int64(len(ck.servers))
+	target := nrand() % n
+
+	for true {
+		reply := GetReply{}
+		target = (target + 1) % n
+		ok := ck.servers[target].Call("KVServer.Get", &args, &reply)
+
+		if !ok {
+			continue
+		}
+
+		switch reply.Err {
+		case OK: 
+			return reply.Value
+		case ErrNoKey:
+			return ""
+		case ErrWrongLeader:
+			continue
+		}
+	}
+	
+	// unreachable
 	return ""
 }
 
@@ -53,7 +79,38 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{}
+
+	switch op {
+	case "Put":
+		args.Type = PUT
+	case "Append":
+		args.Type = APPEND
+	}
+	args.Key = key
+	args.Value = value
+
+	n := int64(len(ck.servers))
+	target := nrand() % n
+
+	for true {
+		reply := PutAppendReply{}
+		target = (target + 1) % n
+		ok := ck.servers[target].Call("KVServer.PutAppend", &args, &reply)
+
+		if !ok {
+			continue
+		}
+
+		switch reply.Err {
+		case OK: 
+			return
+		case ErrNoKey:
+			return
+		case ErrWrongLeader:
+			continue
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
