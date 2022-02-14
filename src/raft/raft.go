@@ -26,6 +26,7 @@ import (
 	"time"
 	"fmt"
 	"math/rand"
+	// "log"
 )
 
 const (
@@ -41,7 +42,7 @@ const (
 
 const HeartBeatInterval int = 150
 
-const CommonInterval int = 50
+const CommonInterval int = 10
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -128,6 +129,10 @@ func (l *Log) lastEntry() Entry {
 	return l.Entries[len(l.Entries) - 1]
 }
 
+func (l *Log) len() int {
+	return len(l.Entries)
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -159,6 +164,7 @@ type Raft struct {
 
 	// for commit
 	channel				chan ApplyMsg
+	// cond 				sync.Cond
 
 	// snapshot state
 	snapshot 			[]byte
@@ -205,7 +211,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log.append(new_entry)
 	rf.persist()
 
-	go rf.startAppendEntries(term, index)
+	go rf.startAppendEntries(term)
 
 	return index, term, isLeader
 }
@@ -278,13 +284,16 @@ func (rf *Raft) SaveStateAndSnapshot() {
 	e.Encode(rf.log)
 	data_state := w.Bytes()
 
-	w = new(bytes.Buffer)
-	e = labgob.NewEncoder(w)
-	e.Encode(rf.snapshot)
-	data_snapshot := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data_state, data_snapshot)
+	rf.persister.SaveStateAndSnapshot(data_state, rf.snapshot)
 }
 
+func (rf *Raft) ReadSnapshot() []byte {
+	return rf.snapshot
+}
+
+func (rf *Raft) RaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
 
 //
 // restore previously persisted state.
@@ -330,6 +339,11 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.snapshotIndex = rf.log.start()
 	rf.snapshotTerm = rf.log.Entries[0].Term
 	rf.lastApplied = rf.snapshotIndex
+	rf.commitIndex = rf.snapshotIndex
+
+	// if rf.lastApplied > rf.log.start() + rf.log.len() {
+	// 	log.Fatalf("1 rf.log.start %d rf.log.last %d rf.lastApplied %d", rf.log.start(), rf.log.last(), rf.lastApplied)
+	// }
 }
 
 
@@ -373,8 +387,15 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.snapshotTerm = lastIncludedTerm
 	rf.snapshot = snapshot
 	rf.SaveStateAndSnapshot()
+	if rf.commitIndex < lastIncludedIndex {
+		rf.commitIndex = lastIncludedIndex
+	}
 
-	DPrintf("[%d] installed snapshot lastIncludedIndex=%d lastIncludedTerm=%d", rf.me, rf.snapshotIndex, rf.snapshotTerm)
+	DPrintf("[%d] installed snapshot lastIncludedIndex=%d lastIncludedTerm=%d commitIndex=%d", rf.me, rf.snapshotIndex, rf.snapshotTerm, rf.commitIndex)
+
+	// if rf.lastApplied > rf.log.start() + rf.log.len() {
+	// 	log.Fatalf("2 rf.log.start %d rf.log.last %d rf.lastApplied %d", rf.log.start(), rf.log.last(), rf.lastApplied)
+	// }
 
 	return true
 }
@@ -388,11 +409,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.log.start() >= index {
+		return
+	}
+
 	rf.snapshot = snapshot
 	rf.log.truncateStart(index)
 	rf.snapshotIndex = index
 	rf.snapshotTerm = rf.log.Entries[0].Term
 	rf.SaveStateAndSnapshot()
+	if rf.commitIndex < index {
+		rf.commitIndex = index
+	}
+
+	// if rf.lastApplied > rf.log.start() + rf.log.len() {
+	// 	log.Fatalf("3 rf.log.start %d rf.log.last %d rf.lastApplied %d", rf.log.start(), rf.log.last(), rf.lastApplied)
+	// }
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -525,7 +557,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else  {
 		// heart beat packet
 		rf.election_timer = time.Now()
-		// DPrintf("[%d] receive AppendEntries from %d term %d currTerm %d prevLogIndex %d prevLogTerm %d", rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
+		DPrintf("[%d] receive AppendEntries from %d term %d currTerm %d prevLogIndex %d prevLogTerm %d", rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
 		rf.leaderId = args.LeaderId
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
@@ -592,14 +624,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		
 		doModified := false
 
-		if rf.log.last() >= args.PrevLogIndex + 1 && rf.log.Entries[args.PrevLogIndex - rf.log.start() + 1].Term != args.Term {
-			// remove the conflict log
-			rf.log.truncateEnd(args.PrevLogIndex + 1)
-			doModified = true
-			DPrintf("[%d] truncate the log, currentLength=%d", rf.me, rf.log.last())
-		}
-		
 		if len(args.Entries) > 0 {
+			if rf.log.last() >= args.PrevLogIndex + 1 && rf.log.Entries[args.PrevLogIndex - rf.log.start() + 1].Term != args.Entries[0].Term {
+				// remove the conflict log
+				rf.log.truncateEnd(args.PrevLogIndex + 1)
+				doModified = true
+				DPrintf("[%d] truncate the log, currentLength=%d", rf.me, rf.log.last())
+			}
 			for i := range args.Entries {
 				if args.PrevLogIndex + i + 1 <= rf.log.last() {
 					continue
@@ -943,7 +974,7 @@ func (rf *Raft) singleAppendEntries(term, server int, heartbeat bool) {
 	}
 }
 
-func (rf *Raft) startAppendEntries(term int, index int) {
+func (rf *Raft) startAppendEntries(term int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -982,13 +1013,13 @@ func (rf *Raft) ticker() {
 func (rf *Raft) electionThread() {
 	for atomic.LoadInt32(&rf.dead) != 1 {
 		interval := time.Duration(rand.Intn(ElectionUpperBound - ElectionLowerBound) + ElectionLowerBound)
-		time.Sleep(time.Millisecond * interval)
+		time.Sleep(time.Millisecond * time.Duration(CommonInterval))
 		rf.mu.Lock()
 		if time.Now().Sub(rf.election_timer) > time.Millisecond * interval && rf.currentState != Leader {
 			// start a new election
 			go rf.startNewElection()
+			rf.election_timer = time.Now()
 		}
-		rf.election_timer = time.Now()
 		rf.mu.Unlock()
 	}
 }
@@ -1009,7 +1040,7 @@ func (rf *Raft) heartbeatThread() {
 		interval := time.Duration(CommonInterval)
 		time.Sleep(time.Millisecond * interval)
 		rf.mu.Lock()
-		if time.Now().Sub(rf.heartbeat_timer) > time.Millisecond * interval && rf.currentState == Leader {
+		if time.Now().Sub(rf.heartbeat_timer) > time.Millisecond * time.Duration(HeartBeatInterval) && rf.currentState == Leader {
 			go rf.sendAllHeartBeatPackage(rf.currentTerm)
 			rf.heartbeat_timer = time.Now()
 		}
@@ -1055,6 +1086,7 @@ func (rf *Raft) updateCommitIndexThread() {
 		interval := time.Duration(CommonInterval)
 		time.Sleep(time.Millisecond * interval)
 		rf.mu.Lock()
+		// doUpdate := false
 		if rf.currentState == Leader {
 			N := rf.commitIndex + 1
 			shouldExit := N > rf.log.last()
@@ -1068,7 +1100,12 @@ func (rf *Raft) updateCommitIndexThread() {
 				if counter >= rf.getMajority() {
 					if rf.log.Entries[N - rf.log.Index0].Term == rf.currentTerm {
 						rf.commitIndex = N
+						// doUpdate = true
 						DPrintf("[%d] update commit index %d curTerm=%d", rf.me, rf.commitIndex, rf.currentTerm)
+
+						// if rf.commitIndex > rf.log.last() {
+						// 	log.Fatalf("rf.commitIndex %d rf.log.last %d", rf.commitIndex, rf.log.last())
+						// }
 					}
 					N++
 				} else {
@@ -1080,6 +1117,10 @@ func (rf *Raft) updateCommitIndexThread() {
 			}
 		}
 		rf.mu.Unlock()
+		
+		// if doUpdate {
+		// 	rf.cond.Signal()
+		// }
 	}
 }
 
@@ -1119,6 +1160,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshot = nil
 	rf.snapshotIndex = 0
 	rf.snapshotTerm = 0
+
+	// rf.cond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 
