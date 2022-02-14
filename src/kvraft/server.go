@@ -12,8 +12,6 @@ import (
 
 const Debug = false
 
-const BufferSize = 1000
-
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
@@ -36,7 +34,10 @@ type Op struct {
 	Key		string
 
 	// who is response to respond this request
-	ID 		int
+	KvID 		int
+	ClientID	int64
+	// requestID
+	SeqID		int
 }
 
 type Entry struct {
@@ -55,116 +56,171 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	// kv storage
 	db					map[string]string
-	currentCommitIndex	int
-
-	cicularBuffer		[BufferSize]Entry
+	// index -> chan
+	commitChannel		map[int]chan Op
+	// clientID -> seqID
+	clientSeq			map[int64]int
 }
 
 func (kv *KVServer) executor() {
 	for kv.killed() == false {
 		msg := <- kv.applyCh
 
-		kv.mu.Lock()
-		command := msg.Command.(Op)
+
 		if msg.CommandValid {
+			kv.mu.Lock()
+			command := msg.Command.(Op)
+			ch, exists := kv.commitChannel[msg.CommandIndex]
+			
 			switch command.Type {
 			case GET:
-				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].getReply
 				value, appear := kv.db[command.Key]
-				if command.ID == kv.me {
+				// check whether i'm responsable to send the command back to channel
+				if command.KvID == kv.me && exists {
 					if !appear {
-						reply.Err = ErrNoKey
+						command.Value = ""
 					} else {
-						reply.Err = OK
-						reply.Value = value
+						command.Value = value
 					}
 				}
 			case APPEND:
-				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].putAppendReply
 				value, appear := kv.db[command.Key]
-				if !appear {
-					kv.db[command.Key] = command.Value
-				} else {
-					kv.db[command.Key] = value + command.Value
+				// first check whether we have applied this command
+				if kv.clientSeq[command.ClientID] < command.SeqID {
+					if !appear {
+						kv.db[command.Key] = command.Value
+					} else {
+						kv.db[command.Key] = value + command.Value
+					}
 				}
-				if command.ID == kv.me {
-					reply.Err = OK
-				}
+				
 			case PUT:
-				reply := kv.cicularBuffer[msg.CommandIndex % BufferSize].putAppendReply
-				kv.db[command.Key] = command.Value
-				if command.ID == kv.me {
-					reply.Err = OK
+				if kv.clientSeq[command.ClientID] < command.SeqID {
+					kv.db[command.Key] = command.Value
 				}
 			}
+
+			// update the seqID to prevent duplicated operation
+			if kv.clientSeq[command.ClientID] < command.SeqID {
+				kv.clientSeq[command.ClientID] = command.SeqID
+			}
+
+			kv.mu.Unlock()
+
+			// DPrintf("[%d] index %d KvID %d exists %v", kv.me, msg.CommandIndex, command.KvID, exists)
+			if command.KvID == kv.me && exists {
+				DPrintf("[%d] Send Op though apply channel index=%d ClientID=%d SeqID=%d", kv.me, msg.CommandIndex, command.ClientID, command.SeqID)
+				ch <- command
+			}
 		}
-		kv.currentCommitIndex = msg.CommandIndex
-		kv.mu.Unlock()
 	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	command := Op{ Type: GET, Key: args.Key, ID: kv.me}
+	command := Op{
+		Type: GET,
+		Key: args.Key,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+	}
+
+	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(command)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
 		return
 	}
+	DPrintf("[%d] start Get command, ClientID=%d SeqID=%d Key=%v", kv.me, args.ClientID, args.SeqID, args.Key)
 
-	// put the reply variable into buffer
-	kv.mu.Lock()
-	DPrintf("[%d] fill cicularBuffer, index=%d", kv.me, index % BufferSize)
-	kv.cicularBuffer[index % BufferSize].getReply = reply
+	// construct the channel and wait on the channel
+	ch := kv.GetChannelL(index)
 	kv.mu.Unlock()
 
-	for kv.killed() == false {
-		time.Sleep(time.Millisecond * 10)
-		kv.mu.Lock()
-		currentCommitIndex := kv.currentCommitIndex
-		kv.mu.Unlock()
-		if currentCommitIndex >= index {
-			break;
+	select {
+	case op := <- ch:
+		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+			reply.Value = ErrWrongLeader
+		} else {
+			reply.Value = op.Value
+			reply.Err = OK
 		}
+		DPrintf("[%d] received reply index=%d ClientID=%d SeqID=%d", kv.me, index, op.ClientID, op.SeqID)
+	case <- time.After(1 * time.Second):
+		reply.Err = ErrTimeout
 	}
+
+	kv.mu.Lock()
+	delete(kv.commitChannel, index)
+	kv.mu.Unlock()
 
 	// check Am I still the leader
 	new_term, new_leader := kv.rf.GetState()
 	if new_term != term || new_leader == false {
 		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
 		return
 	}
+}
 
+// the reason i use GetChannel to construct the channel instead of in the RequestRPC
+// is the commitThread may get ahead of us, so we can't guarantee who is the first one
+// to reach this channel
+// PLEASE HOLD THE LOCK WHEN CALLING THIS METHOD
+func (kv *KVServer) GetChannelL(index int) chan Op {
+	ch, exists := kv.commitChannel[index]
+	if !exists {
+		ch = make(chan Op, 1)
+		kv.commitChannel[index] = ch
+	}
+	return ch
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	command := Op{ Type: args.Type, Key: args.Key, Value: args.Value, ID: kv.me }
+	command := Op{
+		Type: args.Type,
+		Key: args.Key,
+		Value: args.Value,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+	}
+
+	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(command)
 
 	if !isLeader {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
+	DPrintf("[%d] start PutAppend command, ClientID=%d SeqID=%d Key=%v Value=%v", kv.me, args.ClientID, args.SeqID, args.Key, args.Value)
 
-	// put the reply variable into buffer
-	kv.mu.Lock()
-	DPrintf("[%d] fill cicularBuffer, index=%d", kv.me, index % BufferSize)
-	kv.cicularBuffer[index % BufferSize].putAppendReply = reply
+	// construct the channel and wait on the channel
+	// make Start and Construct channel atomic
+	ch := kv.GetChannelL(index)
 	kv.mu.Unlock()
 
-	for kv.killed() == false {
-		time.Sleep(time.Millisecond * 10)
-		kv.mu.Lock()
-		currentCommitIndex := kv.currentCommitIndex
-		kv.mu.Unlock()
-		if currentCommitIndex >= index {
-			break;
+	select {
+	case op := <- ch:
+		// sanity check here
+		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
 		}
+		DPrintf("[%d] received reply index=%d ClientID=%d SeqID=%d", kv.me, index, op.ClientID, op.SeqID)
+	case <- time.After(1 * time.Second):
+		reply.Err = ErrTimeout
 	}
+
+	// delete channel
+	kv.mu.Lock()
+	delete(kv.commitChannel, index)
+	kv.mu.Unlock()
 
 	// check Am I still the leader
 	new_term, new_leader := kv.rf.GetState()
@@ -225,8 +281,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.currentCommitIndex = 0
 	kv.db = make(map[string]string)
+	kv.commitChannel = make(map[int]chan Op)
+	kv.clientSeq = make(map[int64]int)
 
 	go kv.executor()
 
