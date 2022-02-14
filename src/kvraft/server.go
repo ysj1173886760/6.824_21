@@ -8,9 +8,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 )
 
 const Debug = false
+
+const CommonInterval = 10
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -62,6 +65,10 @@ type KVServer struct {
 	commitChannel		map[int]chan Op
 	// clientID -> seqID
 	clientSeq			map[int64]int
+	// commit index used in snapshot
+	commitIndex 		int
+
+	// timeMap 			map[int]time.Time
 }
 
 func (kv *KVServer) executor() {
@@ -101,6 +108,8 @@ func (kv *KVServer) executor() {
 					kv.db[command.Key] = command.Value
 				}
 			}
+			// update commit Index
+			kv.commitIndex = msg.CommandIndex
 
 			// update the seqID to prevent duplicated operation
 			if kv.clientSeq[command.ClientID] < command.SeqID {
@@ -112,8 +121,41 @@ func (kv *KVServer) executor() {
 			// DPrintf("[%d] index %d KvID %d exists %v", kv.me, msg.CommandIndex, command.KvID, exists)
 			if command.KvID == kv.me && exists {
 				DPrintf("[%d] Send Op though apply channel index=%d ClientID=%d SeqID=%d", kv.me, msg.CommandIndex, command.ClientID, command.SeqID)
+				// DPrintf("[%d] commit time used %v", kv.me, time.Since(kv.timeMap[msg.CommandIndex]))
 				ch <- command
 			}
+		} else if msg.SnapshotValid {
+			go kv.applySnapshot(msg.Snapshot, msg.SnapshotTerm, msg.SnapshotIndex)
+		}
+	}
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte, snapshotTerm, snapshotIndex int) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	var db map[string]string
+	var clientSeq map[int64]int
+	var commitIndex int
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&db) != nil ||
+	   d.Decode(&clientSeq) != nil ||
+	   d.Decode(&commitIndex) != nil {
+		DPrintf("[%d] failed to read from snapshot", kv.me)
+	} else {
+		if kv.rf.CondInstallSnapshot(snapshotTerm, snapshotIndex, snapshot) {
+			kv.mu.Lock()
+			kv.clientSeq = clientSeq
+			kv.db = db
+			kv.commitIndex = commitIndex
+			DPrintf("[%d] apply snapshot term=%d index=%d commitIndex=%d", kv.me, snapshotTerm, snapshotIndex, kv.commitIndex)
+			kv.mu.Unlock()
+		} else {
+			DPrintf("[%d] failed to apply snapshot term=%d index=%d", kv.me, snapshotTerm, snapshotIndex)
 		}
 	}
 }
@@ -129,6 +171,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(command)
+	// kv.timeMap[index] = time.Now()
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -144,7 +187,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case op := <- ch:
 		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
-			reply.Value = ErrWrongLeader
+			reply.Err = ErrWrongLeader
 		} else {
 			reply.Value = op.Value
 			reply.Err = OK
@@ -191,6 +234,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(command)
+	// kv.timeMap[index] = time.Now()
 
 	if !isLeader {
 		kv.mu.Unlock()
@@ -230,6 +274,38 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
+func (kv *KVServer) snapshotThread() {
+	if kv.maxraftstate == -1 {
+		return
+	}
+
+	threshold := int(float64(kv.maxraftstate) * 0.9)
+	for kv.killed() == false {
+		interval := time.Duration(CommonInterval)
+		time.Sleep(time.Millisecond * interval)
+		
+		if kv.rf.RaftStateSize() > threshold {
+			// start snapshot
+			kv.mu.Lock()
+			DPrintf("[%d] startSnapshot index=%d", kv.me, kv.commitIndex)
+
+			// if we can do COW would be greater
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.db)
+			e.Encode(kv.clientSeq)
+			e.Encode(kv.commitIndex)
+			commitIndex := kv.commitIndex
+
+			kv.mu.Unlock()
+
+			data := w.Bytes()
+			kv.rf.Snapshot(commitIndex, data)
+		}
+
+	}
+}
+
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
@@ -249,6 +325,32 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) readPersist() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	snapshot := kv.rf.ReadSnapshot()
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	
+	var db map[string]string
+	var clientSeq map[int64]int
+	var commitIndex int
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&db) != nil ||
+	   d.Decode(&clientSeq) != nil ||
+	   d.Decode(&commitIndex) != nil {
+		DPrintf("[%d] failed to read from persist", kv.me)
+	} else {
+		kv.clientSeq = clientSeq
+		kv.db = db
+		kv.commitIndex = commitIndex
+		DPrintf("[%d] recover from persist, commitIndex=%d", kv.me, kv.commitIndex)
+	}
 }
 
 //
@@ -284,8 +386,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.db = make(map[string]string)
 	kv.commitChannel = make(map[int]chan Op)
 	kv.clientSeq = make(map[int64]int)
+	// kv.timeMap = make(map[int]time.Time)
+	kv.commitIndex = 0
+
+	kv.readPersist()
 
 	go kv.executor()
+	go kv.snapshotThread()
 
 	return kv
 }

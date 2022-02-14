@@ -124,7 +124,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	for true {
 		reply := PutAppendReply{}
+		// start := time.Now()
 		ok := ck.servers[ck.lastLeader].Call("KVServer.PutAppend", &args, &reply)
+		// DPrintf("[%d] Request time used %v", ck.ID, time.Since(start))
 
 		if !ok {
 			ck.lastLeader = (ck.lastLeader + 1) % ck.n
