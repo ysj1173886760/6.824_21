@@ -557,7 +557,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else  {
 		// heart beat packet
 		rf.election_timer = time.Now()
-		DPrintf("[%d] receive AppendEntries from %d term %d currTerm %d prevLogIndex %d prevLogTerm %d", rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
+		// DPrintf("[%d] receive AppendEntries from %d term %d currTerm %d prevLogIndex %d prevLogTerm %d", rf.me, args.LeaderId, args.Term, rf.currentTerm, args.PrevLogIndex, args.PrevLogTerm)
 		rf.leaderId = args.LeaderId
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
@@ -625,15 +625,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		doModified := false
 
 		if len(args.Entries) > 0 {
-			if rf.log.last() >= args.PrevLogIndex + 1 && rf.log.Entries[args.PrevLogIndex - rf.log.start() + 1].Term != args.Entries[0].Term {
-				// remove the conflict log
-				rf.log.truncateEnd(args.PrevLogIndex + 1)
-				doModified = true
-				DPrintf("[%d] truncate the log, currentLength=%d", rf.me, rf.log.last())
-			}
 			for i := range args.Entries {
 				if args.PrevLogIndex + i + 1 <= rf.log.last() {
-					continue
+					if rf.log.Entries[args.PrevLogIndex - rf.log.start() + i + 1].Term != args.Entries[i].Term {
+						// remove the conflict log
+						rf.log.truncateEnd(args.PrevLogIndex + 1 + i)
+						doModified = true
+						DPrintf("[%d] truncate the log, currentLength=%d", rf.me, rf.log.last())
+					} else {
+						continue
+					}
 				}
 				rf.log.append(args.Entries[i])
 				doModified = true
@@ -914,7 +915,7 @@ func (rf *Raft) singleAppendEntries(term, server int, heartbeat bool) {
 		}
 	}
 
-	// DPrintf("[%d] AppendEntries to %d term=%d prevLogIndex=%d prevLogTerm=%d commitIndex=%d", rf.me, server, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+	DPrintf("[%d] AppendEntries to %d term=%d prevLogIndex=%d prevLogTerm=%d commitIndex=%d", rf.me, server, args.Term, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 	rf.mu.Unlock()
 
 	reply := AppendEntriesReply{}
@@ -1093,6 +1094,9 @@ func (rf *Raft) updateCommitIndexThread() {
 			for !shouldExit {
 				counter := 1
 				for idx := range rf.peers {
+					if idx == rf.me {
+						continue
+					}
 					if rf.matchIndex[idx] >= N {
 						counter++
 					}
