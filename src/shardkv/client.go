@@ -39,7 +39,12 @@ type Clerk struct {
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	
+	// for every group of server, we have to remember the lastLeader
+	// GID -> lastLeader
+	// lastLeader 	map[int]int
+	ID 			int64
+	SeqID 		int
 }
 
 //
@@ -55,7 +60,9 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	
+	ck.ID = nrand()
+
 	return ck
 }
 
@@ -68,6 +75,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+
+	ck.SeqID++
+	args.ClientID = ck.ID
+	args.SeqID = ck.SeqID
 
 	for {
 		shard := key2shard(key)
@@ -105,6 +116,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Value = value
 	args.Op = op
 
+	ck.SeqID++
+	args.ClientID = ck.ID
+	args.SeqID = ck.SeqID
 
 	for {
 		shard := key2shard(key)

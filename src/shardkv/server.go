@@ -5,13 +5,54 @@ import "6.824/labrpc"
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
+import "6.824/shardctrler"
+import "log"
+import "sync/atomic"
+import "time"
+import "bytes"
 
+const Debug = true
 
+const CommonInterval = 10
+const ConfigPullInterval = 100
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+const (
+	PUT		= "Put"
+	APPEND	= "Append"
+	GET		= "Get"
+)
+
+const (
+	OPERATION 	= "Operation"
+	CONFIG 		= "Config"
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Type    string
+	Value	string
+	Key		string
+
+	// who is response to respond this request
+	KvID 		int
+	ClientID	int64
+	// requestID
+	SeqID		int
+}
+
+type ConfigLog struct {
+	Config	shardctrler.Config
+}
+
+type Command struct {
+	Type 	string
+	Data	interface{}
 }
 
 type ShardKV struct {
@@ -23,17 +64,321 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	dead		 int32
+	
+	// shardController
+	sc      	*shardctrler.Clerk
 
-	// Your definitions here.
+	// kv storage
+	db					map[string]string
+	// index -> chan
+	commitChannel		map[int]chan Op
+	// clientID -> seqID
+	clientSeq			map[int64]int
+	// commit index used in snapshot
+	commitIndex 		int
+	// currentConfig
+	curConfig 		shardctrler.Config
+	// previousConfig
+	preConfig 	shardctrler.Config
 }
 
+func (kv *ShardKV) startNewConfig(config *shardctrler.Config) {
+	log := *config
+	command := Command{ Type: CONFIG, Data: ConfigLog{log} }
+	kv.rf.Start(command)
+}
+
+func (kv *ShardKV) configPuller() {
+	for kv.killed() == false {
+		time.Sleep(time.Millisecond * time.Duration(ConfigPullInterval))
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			continue
+		}
+		kv.mu.Lock()
+		currentConfigNum := kv.curConfig.Num
+		kv.mu.Unlock()
+
+		config := kv.sc.Query(currentConfigNum + 1)
+		if config.Num == currentConfigNum + 1 {
+			// we commit this config
+			kv.startNewConfig(&config)
+			DPrintf("[%d-%d] pulled new config %v start to commit", kv.gid, kv.me, config)
+		}
+
+	}
+}
+
+func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	ch, exists := kv.commitChannel[msg.CommandIndex]
+	C := msg.Command.(Command)
+	command := C.Data.(Op)
+
+	switch command.Type {
+	case GET:
+		value, appear := kv.db[command.Key]
+		// check whether i'm responsable to send the command back to channel
+		if command.KvID == kv.me && exists {
+			if !appear {
+				command.Value = ""
+			} else {
+				command.Value = value
+			}
+		}
+	case APPEND:
+		value, appear := kv.db[command.Key]
+		// first check whether we have applied this command
+		if kv.clientSeq[command.ClientID] < command.SeqID {
+			if !appear {
+				kv.db[command.Key] = command.Value
+			} else {
+				kv.db[command.Key] = value + command.Value
+			}
+		}
+		
+	case PUT:
+		if kv.clientSeq[command.ClientID] < command.SeqID {
+			kv.db[command.Key] = command.Value
+		}
+	}
+	// update commit Index
+	kv.commitIndex = msg.CommandIndex
+
+	// update the seqID to prevent duplicated operation
+	if kv.clientSeq[command.ClientID] < command.SeqID {
+		kv.clientSeq[command.ClientID] = command.SeqID
+	}
+
+	kv.mu.Unlock()
+
+	if command.KvID == kv.me && exists {
+		DPrintf("[%d-%d] Send Op though apply channel index=%d ClientID=%d SeqID=%d", kv.gid, kv.me, msg.CommandIndex, command.ClientID, command.SeqID)
+		ch <- command
+	}
+}
+
+func (kv *ShardKV) applyConfig(msg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	C := msg.Command.(Command)
+	configLog := C.Data.(ConfigLog)
+	if kv.curConfig.Num >= configLog.Config.Num {
+		return
+	}
+	kv.preConfig = kv.curConfig
+	kv.curConfig = configLog.Config
+	DPrintf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
+}
+
+func (kv *ShardKV) executor() {
+	for kv.killed() == false {
+		msg := <- kv.applyCh
+
+
+		if msg.CommandValid {
+			command := msg.Command.(Command)
+			switch command.Type {
+			case OPERATION:
+				kv.applyOperation(&msg)
+			case CONFIG:
+				kv.applyConfig(&msg)
+			}
+		} else if msg.SnapshotValid {
+			go kv.applySnapshot(msg.Snapshot, msg.SnapshotTerm, msg.SnapshotIndex)
+		}
+	}
+}
+
+func (kv *ShardKV) checkShardKeyL(key string) bool {
+	shard := key2shard(key)
+	return kv.curConfig.Shards[shard] == kv.gid
+}
+
+func (kv *ShardKV) applySnapshot(snapshot []byte, snapshotTerm, snapshotIndex int) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	var db map[string]string
+	var clientSeq map[int64]int
+	var commitIndex int
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&db) != nil ||
+	   d.Decode(&clientSeq) != nil ||
+	   d.Decode(&commitIndex) != nil {
+		DPrintf("[%d-%d] failed to read from snapshot", kv.gid, kv.me)
+	} else {
+		if kv.rf.CondInstallSnapshot(snapshotTerm, snapshotIndex, snapshot) {
+			kv.mu.Lock()
+			kv.clientSeq = clientSeq
+			kv.db = db
+			kv.commitIndex = commitIndex
+			DPrintf("[%d-%d] apply snapshot term=%d index=%d commitIndex=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex, kv.commitIndex)
+			kv.mu.Unlock()
+		} else {
+			DPrintf("[%d-%d] failed to apply snapshot term=%d index=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex)
+		}
+	}
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	command := Op {
+		Type: GET,
+		Key: args.Key,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+	}
+
+	kv.mu.Lock()
+
+	if kv.checkShardKeyL(args.Key) == false {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	index, term, isLeader := kv.rf.Start(Command{ Type: OPERATION, Data: command })
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	DPrintf("[%d-%d] start Get command, ClientID=%d SeqID=%d Key=%v", kv.gid, kv.me, args.ClientID, args.SeqID, args.Key)
+
+	// construct the channel and wait on the channel
+	ch := kv.GetChannelL(index)
+	kv.mu.Unlock()
+
+	select {
+	case op := <- ch:
+		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Value = op.Value
+			reply.Err = OK
+		}
+		DPrintf("[%d-%d] received reply index=%d ClientID=%d SeqID=%d", kv.gid, kv.me, index, op.ClientID, op.SeqID)
+	case <- time.After(1 * time.Second):
+		reply.Err = ErrTimeout
+	}
+
+	kv.mu.Lock()
+	delete(kv.commitChannel, index)
+	kv.mu.Unlock()
+
+	// check Am I still the leader
+	new_term, new_leader := kv.rf.GetState()
+	if new_term != term || new_leader == false {
+		reply.Err = ErrWrongLeader
+		return
+	}
+}
+
+func (kv *ShardKV) GetChannelL(index int) chan Op {
+	ch, exists := kv.commitChannel[index]
+	if !exists {
+		ch = make(chan Op, 1)
+		kv.commitChannel[index] = ch
+	}
+	return ch
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	command := Op {
+		Type: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+	}
+
+	kv.mu.Lock()
+
+	if kv.checkShardKeyL(args.Key) == false {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	index, term, isLeader := kv.rf.Start(Command{ Type: OPERATION, Data: command })
+	// kv.timeMap[index] = time.Now()
+
+	if !isLeader {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d-%d] start PutAppend command, ClientID=%d SeqID=%d Key=%v Value=%v", kv.gid, kv.me, args.ClientID, args.SeqID, args.Key, args.Value)
+
+	// construct the channel and wait on the channel
+	// make Start and Construct channel atomic
+	ch := kv.GetChannelL(index)
+	kv.mu.Unlock()
+
+	select {
+	case op := <- ch:
+		// sanity check here
+		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+		}
+		DPrintf("[%d-%d] received reply index=%d ClientID=%d SeqID=%d", kv.gid, kv.me, index, op.ClientID, op.SeqID)
+	case <- time.After(1 * time.Second):
+		reply.Err = ErrTimeout
+	}
+
+	// delete channel
+	kv.mu.Lock()
+	delete(kv.commitChannel, index)
+	kv.mu.Unlock()
+
+	// check Am I still the leader
+	new_term, new_leader := kv.rf.GetState()
+	if new_term != term || new_leader == false {
+		reply.Err = ErrWrongLeader
+		return
+	}
+}
+
+func (kv *ShardKV) snapshotThread() {
+	if kv.maxraftstate == -1 {
+		return
+	}
+
+	threshold := int(float64(kv.maxraftstate) * 0.9)
+	for kv.killed() == false {
+		interval := time.Duration(CommonInterval)
+		time.Sleep(time.Millisecond * interval)
+		
+		if kv.rf.RaftStateSize() > threshold {
+			// start snapshot
+			kv.mu.Lock()
+			DPrintf("[%d-%d] startSnapshot index=%d", kv.gid, kv.me, kv.commitIndex)
+
+			// if we can do COW would be greater
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.db)
+			e.Encode(kv.clientSeq)
+			e.Encode(kv.commitIndex)
+			commitIndex := kv.commitIndex
+
+			kv.mu.Unlock()
+
+			data := w.Bytes()
+			kv.rf.Snapshot(commitIndex, data)
+		}
+
+	}
 }
 
 //
@@ -43,10 +388,40 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+func (kv *ShardKV) readPersist() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	snapshot := kv.rf.ReadSnapshot()
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	
+	var db map[string]string
+	var clientSeq map[int64]int
+	var commitIndex int
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&db) != nil ||
+	   d.Decode(&clientSeq) != nil ||
+	   d.Decode(&commitIndex) != nil {
+		DPrintf("[%d-%d] failed to read from persist", kv.gid, kv.me)
+	} else {
+		kv.clientSeq = clientSeq
+		kv.db = db
+		kv.commitIndex = commitIndex
+		DPrintf("[%d-%d] recover from persist, commitIndex=%d", kv.gid, kv.me, kv.commitIndex)
+	}
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -80,9 +455,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(Command{})
+	labgob.Register(shardctrler.Config{})
+	labgob.Register(ConfigLog{})
 
 	kv := new(ShardKV)
 	kv.me = me
+	kv.dead = 0
 	kv.maxraftstate = maxraftstate
 	kv.make_end = make_end
 	kv.gid = gid
@@ -96,6 +475,17 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.db = make(map[string]string)
+	kv.commitChannel = make(map[int]chan Op)
+	kv.clientSeq = make(map[int64]int)
+	kv.commitIndex = 0
+	kv.sc = shardctrler.MakeClerk(ctrlers)
+
+	kv.readPersist()
+
+	go kv.executor()
+	go kv.snapshotThread()
+	go kv.configPuller()
 
 	return kv
 }

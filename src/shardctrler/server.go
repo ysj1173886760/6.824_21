@@ -233,7 +233,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		} else {
 			reply.Err = OK
 			reply.Config = op.Config
-			// DPrintf("[%d] return config %v", sc.me, op.Config)
+			DPrintf("[%d] return config %v", sc.me, op.Config)
 		}
 	case <- time.After(1 * time.Second):
 		reply.Err = ErrTimeout
