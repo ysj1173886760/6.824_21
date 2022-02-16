@@ -243,6 +243,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	if kv.clientSeq[args.ClientID] >= args.SeqID {
+		reply.Err = OK
+		reply.Value = kv.db[args.Key]
+		kv.mu.Unlock()
+		return
+	}
+
 	index, term, isLeader := kv.rf.Start(Command{ Type: OPERATION, Data: command })
 
 	if !isLeader {
@@ -304,6 +311,12 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	if kv.checkShardKeyL(args.Key) == false {
 		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+
+	if kv.clientSeq[args.ClientID] >= args.SeqID {
+		reply.Err = OK
 		kv.mu.Unlock()
 		return
 	}
