@@ -55,6 +55,11 @@ type Command struct {
 	Data	interface{}
 }
 
+type Shard struct {
+	db				map[string]string
+	clientSeq		map[int64]int
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -69,12 +74,9 @@ type ShardKV struct {
 	// shardController
 	sc      	*shardctrler.Clerk
 
-	// kv storage
-	db					map[string]string
+	shard				[shardctrler.NShards]Shard
 	// index -> chan
 	commitChannel		map[int]chan Op
-	// clientID -> seqID
-	clientSeq			map[int64]int
 	// commit index used in snapshot
 	commitIndex 		int
 	// currentConfig
@@ -115,10 +117,11 @@ func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
 	ch, exists := kv.commitChannel[msg.CommandIndex]
 	C := msg.Command.(Command)
 	command := C.Data.(Op)
+	shard := key2shard(command.Key)
 
 	switch command.Type {
 	case GET:
-		value, appear := kv.db[command.Key]
+		value, appear := kv.shard[shard].db[command.Key]
 		// check whether i'm responsable to send the command back to channel
 		if command.KvID == kv.me && exists {
 			if !appear {
@@ -128,27 +131,27 @@ func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
 			}
 		}
 	case APPEND:
-		value, appear := kv.db[command.Key]
+		value, appear := kv.shard[shard].db[command.Key]
 		// first check whether we have applied this command
-		if kv.clientSeq[command.ClientID] < command.SeqID {
+		if kv.shard[shard].clientSeq[command.ClientID] < command.SeqID {
 			if !appear {
-				kv.db[command.Key] = command.Value
+				kv.shard[shard].db[command.Key] = command.Value
 			} else {
-				kv.db[command.Key] = value + command.Value
+				kv.shard[shard].db[command.Key] = value + command.Value
 			}
 		}
 		
 	case PUT:
-		if kv.clientSeq[command.ClientID] < command.SeqID {
-			kv.db[command.Key] = command.Value
+		if kv.shard[shard].clientSeq[command.ClientID] < command.SeqID {
+			kv.shard[shard].db[command.Key] = command.Value
 		}
 	}
 	// update commit Index
 	kv.commitIndex = msg.CommandIndex
 
 	// update the seqID to prevent duplicated operation
-	if kv.clientSeq[command.ClientID] < command.SeqID {
-		kv.clientSeq[command.ClientID] = command.SeqID
+	if kv.shard[shard].clientSeq[command.ClientID] < command.SeqID {
+		kv.shard[shard].clientSeq[command.ClientID] = command.SeqID
 	}
 
 	kv.mu.Unlock()
@@ -196,36 +199,6 @@ func (kv *ShardKV) checkShardKeyL(key string) bool {
 	return kv.curConfig.Shards[shard] == kv.gid
 }
 
-func (kv *ShardKV) applySnapshot(snapshot []byte, snapshotTerm, snapshotIndex int) {
-	if snapshot == nil || len(snapshot) < 1 {
-		return
-	}
-
-	var db map[string]string
-	var clientSeq map[int64]int
-	var commitIndex int
-
-	r := bytes.NewBuffer(snapshot)
-	d := labgob.NewDecoder(r)
-
-	if d.Decode(&db) != nil ||
-	   d.Decode(&clientSeq) != nil ||
-	   d.Decode(&commitIndex) != nil {
-		DPrintf("[%d-%d] failed to read from snapshot", kv.gid, kv.me)
-	} else {
-		if kv.rf.CondInstallSnapshot(snapshotTerm, snapshotIndex, snapshot) {
-			kv.mu.Lock()
-			kv.clientSeq = clientSeq
-			kv.db = db
-			kv.commitIndex = commitIndex
-			DPrintf("[%d-%d] apply snapshot term=%d index=%d commitIndex=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex, kv.commitIndex)
-			kv.mu.Unlock()
-		} else {
-			DPrintf("[%d-%d] failed to apply snapshot term=%d index=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex)
-		}
-	}
-}
-
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	command := Op {
 		Type: GET,
@@ -243,9 +216,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	if kv.clientSeq[args.ClientID] >= args.SeqID {
+	shard := key2shard(args.Key)
+	if kv.shard[shard].clientSeq[args.ClientID] >= args.SeqID {
 		reply.Err = OK
-		reply.Value = kv.db[args.Key]
+		reply.Value = kv.shard[shard].db[args.Key]
 		kv.mu.Unlock()
 		return
 	}
@@ -315,7 +289,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if kv.clientSeq[args.ClientID] >= args.SeqID {
+	shard := key2shard(args.Key)
+	if kv.shard[shard].clientSeq[args.ClientID] >= args.SeqID {
 		reply.Err = OK
 		kv.mu.Unlock()
 		return
@@ -380,8 +355,7 @@ func (kv *ShardKV) snapshotThread() {
 			// if we can do COW would be greater
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
-			e.Encode(kv.db)
-			e.Encode(kv.clientSeq)
+			e.Encode(kv.shard)
 			e.Encode(kv.commitIndex)
 			commitIndex := kv.commitIndex
 
@@ -418,23 +392,49 @@ func (kv *ShardKV) readPersist() {
 		return
 	}
 	
-	var db map[string]string
-	var clientSeq map[int64]int
+	var shard [shardctrler.NShards]Shard
 	var commitIndex int
 
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&db) != nil ||
-	   d.Decode(&clientSeq) != nil ||
+
+	if d.Decode(&shard) != nil ||
 	   d.Decode(&commitIndex) != nil {
 		DPrintf("[%d-%d] failed to read from persist", kv.gid, kv.me)
 	} else {
-		kv.clientSeq = clientSeq
-		kv.db = db
+		kv.shard = shard
 		kv.commitIndex = commitIndex
 		DPrintf("[%d-%d] recover from persist, commitIndex=%d", kv.gid, kv.me, kv.commitIndex)
 	}
 }
+
+func (kv *ShardKV) applySnapshot(snapshot []byte, snapshotTerm, snapshotIndex int) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	var shard [shardctrler.NShards]Shard
+	var commitIndex int
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&shard) != nil ||
+	   d.Decode(&commitIndex) != nil {
+		DPrintf("[%d-%d] failed to read from snapshot", kv.gid, kv.me)
+	} else {
+		if kv.rf.CondInstallSnapshot(snapshotTerm, snapshotIndex, snapshot) {
+			kv.mu.Lock()
+			kv.shard = shard
+			kv.commitIndex = commitIndex
+			DPrintf("[%d-%d] apply snapshot term=%d index=%d commitIndex=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex, kv.commitIndex)
+			kv.mu.Unlock()
+		} else {
+			DPrintf("[%d-%d] failed to apply snapshot term=%d index=%d", kv.gid, kv.me, snapshotTerm, snapshotIndex)
+		}
+	}
+}
+
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -488,11 +488,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.db = make(map[string]string)
 	kv.commitChannel = make(map[int]chan Op)
-	kv.clientSeq = make(map[int64]int)
 	kv.commitIndex = 0
 	kv.sc = shardctrler.MakeClerk(ctrlers)
+
+	for i := range kv.shard {
+		kv.shard[i].db = make(map[string]string)
+		kv.shard[i].clientSeq = make(map[int64]int)
+	}
 
 	kv.readPersist()
 
