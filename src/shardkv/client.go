@@ -14,6 +14,8 @@ import "math/big"
 import "6.824/shardctrler"
 import "time"
 
+const RetryCount = 3
+
 //
 // which shard is a key in?
 // please use this function,
@@ -85,17 +87,27 @@ func (ck *Clerk) Get(key string) string {
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
+			for si, wrongGroup := 0, false; si < len(servers) && !wrongGroup; si++ {
+				for cnt := 0; cnt < RetryCount; cnt++ {
+					srv := ck.make_end(servers[si])
+					var reply GetReply
+					ok := srv.Call("ShardKV.Get", &args, &reply)
+					if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+						return reply.Value
+					}
+					if ok && (reply.Err == ErrWrongGroup) {
+						wrongGroup = true
+						break
+					}
+					if ok && reply.Err == ErrWrongLeader {
+						// switch the leader
+						break
+					}
+					if ok && (reply.Err == ErrTimeout || reply.Err == ErrTryAgain) {
+						// we retry this operation
+					}
+					// ... not ok
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -124,17 +136,27 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
+			for si, wrongGroup := 0, false; si < len(servers) && !wrongGroup; si++ {
+				for cnt := 0; cnt < RetryCount; cnt++ {
+					srv := ck.make_end(servers[si])
+					var reply PutAppendReply
+					ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+					if ok && reply.Err == OK {
+						return
+					}
+					if ok && reply.Err == ErrWrongGroup {
+						wrongGroup = true
+						break
+					}
+					if ok && reply.Err == ErrWrongLeader {
+						// switch the leader
+						break
+					}
+					if ok && (reply.Err == ErrTimeout || reply.Err == ErrTryAgain) {
+						// we retry this operation
+					}
+					// ... not ok
 				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)

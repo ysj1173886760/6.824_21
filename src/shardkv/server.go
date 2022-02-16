@@ -34,6 +34,14 @@ const (
 	CONFIG 		= "Config"
 )
 
+const (
+	VALID 			= "Valid"
+	INVALID 		= "Invalid"
+	REQUESTDATA 	= "RequestData"
+	WAITREQUEST 	= "WaitRequest"
+	NOTIFYDELETE 	= "NotifyDelete"
+)
+
 type Op struct {
 	Type    string
 	Value	string
@@ -58,6 +66,7 @@ type Command struct {
 type Shard struct {
 	db				map[string]string
 	clientSeq		map[int64]int
+	state 			string
 }
 
 type ShardKV struct {
@@ -217,6 +226,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	shard := key2shard(args.Key)
+	if kv.shard[shard].state == REQUESTDATA {
+		// although i'm responseable for this data, but i need some time to request the data, so please wait for a second
+		reply.Err = ErrTryAgain
+		kv.mu.Unlock()
+		return
+	}
+
 	if kv.shard[shard].clientSeq[args.ClientID] >= args.SeqID {
 		reply.Err = OK
 		reply.Value = kv.shard[shard].db[args.Key]
@@ -290,6 +306,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	shard := key2shard(args.Key)
+
+	if kv.shard[shard].state == REQUESTDATA {
+		reply.Err = ErrTryAgain
+		kv.mu.Unlock()
+		return
+	}
+
 	if kv.shard[shard].clientSeq[args.ClientID] >= args.SeqID {
 		reply.Err = OK
 		kv.mu.Unlock()
@@ -495,6 +518,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	for i := range kv.shard {
 		kv.shard[i].db = make(map[string]string)
 		kv.shard[i].clientSeq = make(map[int64]int)
+		kv.shard[i].state = INVALID
 	}
 
 	kv.readPersist()
