@@ -100,6 +100,16 @@ func (kv *ShardKV) startNewConfig(config *shardctrler.Config) {
 	kv.rf.Start(command)
 }
 
+func (kv *ShardKV) checkCanPullConfigL() bool {
+	for shardID := 0; shardID < shardctrler.NShards; shardID++ {
+		// during the config
+		if kv.shard[shardID].state != INVALID && kv.shard[shardID].state != VALID {
+			return false
+		}
+	}
+	return true
+}
+
 func (kv *ShardKV) configPuller() {
 	for kv.killed() == false {
 		time.Sleep(time.Millisecond * time.Duration(ConfigPullInterval))
@@ -109,13 +119,16 @@ func (kv *ShardKV) configPuller() {
 		}
 		kv.mu.Lock()
 		currentConfigNum := kv.curConfig.Num
+		shouldPullConfig := kv.checkCanPullConfigL()
 		kv.mu.Unlock()
 
-		config := kv.sc.Query(currentConfigNum + 1)
-		if config.Num == currentConfigNum + 1 {
-			// we commit this config
-			kv.startNewConfig(&config)
-			DPrintf("[%d-%d] pulled new config %v start to commit", kv.gid, kv.me, config)
+		if shouldPullConfig {
+			config := kv.sc.Query(currentConfigNum + 1)
+			if config.Num == currentConfigNum + 1 {
+				// we commit this config
+				kv.startNewConfig(&config)
+				DPrintf("[%d-%d] pulled new config %v start to commit", kv.gid, kv.me, config)
+			}
 		}
 
 	}
@@ -171,6 +184,31 @@ func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
 	}
 }
 
+func (kv *ShardKV) updateShardStateL() {
+	for shardID := 0; shardID < shardctrler.NShards; shardID++ {
+		// if it previously belong to me
+		if kv.preConfig.Shards[shardID] == kv.gid {
+			if kv.curConfig.Shards[shardID] == 0 {
+				// if no one is response for this shard, maybe we can discard it?
+				kv.shard[shardID].state = INVALID
+			} else if kv.curConfig.Shards[shardID] != kv.gid {
+				// if it doesn't belong to me, set it to WaitRequest state
+				kv.shard[shardID].state = WAITREQUEST
+			}
+		}
+		// if it currently belong to me
+		if kv.curConfig.Shards[shardID] == kv.gid {
+			if kv.preConfig.Shards[shardID] == 0 {
+				// if no one is response for it before, we can start serving immediately
+				kv.shard[shardID].state = VALID
+			} else if kv.preConfig.Shards[shardID] != kv.gid {
+				// if it doesn't belong to me previously, then we start to request the data
+				kv.shard[shardID].state = REQUESTDATA
+			}
+		}
+	}
+}
+
 func (kv *ShardKV) applyConfig(msg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -181,6 +219,7 @@ func (kv *ShardKV) applyConfig(msg *raft.ApplyMsg) {
 	}
 	kv.preConfig = kv.curConfig
 	kv.curConfig = configLog.Config
+	kv.updateShardStateL()
 	DPrintf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
 }
 
