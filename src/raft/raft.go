@@ -874,6 +874,21 @@ func (rf *Raft) startNewElection() {
 	}
 }
 
+// check whether we have append the log with the newest term
+func (rf *Raft) CheckLogTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.log.lastEntry().Term == rf.currentTerm
+}
+
+func (rf *Raft) GetLastLogIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.log.last()
+}
+
 func (rf *Raft) getMajority() int {
 	// since we won't change our cluster members, thus we don't need to acquire lock here
 	return len(rf.peers) / 2 + 1
