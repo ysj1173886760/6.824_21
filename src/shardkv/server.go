@@ -16,8 +16,9 @@ const Debug = false
 
 const CommonInterval = 10
 const ConfigPullInterval = 100
-const DataPullInterval = 100
-const DataDeleteInterval = 100
+const DataPullInterval = 300
+const DataDeleteInterval = 300
+const LogCheckingInterval = 300
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -33,10 +34,12 @@ const (
 )
 
 const (
-	OPERATION 	= "Operation"
-	CONFIG 		= "Config"
-	SHARDDATA	= "ShardData"
-	DELETEDATA  = "DeleteData"
+	OPERATION 		= "Operation"
+	CONFIG 			= "Config"
+	SHARDDATA		= "ShardData"
+	DELETEDATA  	= "DeleteData"
+	EMPTY			= "Empty"
+	CONFIRMDELETE 	= "ConfirmDelete"
 )
 
 const (
@@ -52,11 +55,24 @@ type Op struct {
 	Value	string
 	Key		string
 
+	// for rechecking
+	Err			Err
+	ConfigNum   int
+
 	// who is response to respond this request
 	KvID 		int
 	ClientID	int64
 	// requestID
 	SeqID		int
+}
+
+type EmptyLog struct {
+
+}
+
+type ConfirmLog struct {
+	ConfigNum	int
+	ShardID 	int
 }
 
 type ConfigLog struct {
@@ -100,6 +116,9 @@ type ShardKV struct {
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 	dead		 int32
+
+	// gid -> lastLeader
+	lastLeaderCache 	map[int]int
 	
 	// shardController
 	sc      	*shardctrler.Clerk
@@ -248,12 +267,23 @@ func DuplicateClientSeq(mp map[int64]int) map[int64]int {
 }
 
 func (kv *ShardKV) RequestDelete(args *RequestDeleteArgs, reply *RequestDeleteReply) {
+	// only leader can delete data
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.WrongLeader = true
+		reply.Deleted = false
+		return
+	}
+
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	reply.GID = kv.gid
-	if args.ConfigNum != kv.curConfig.Num {
-		DPrintf("[%d-%d] reject request delete from %d due to unmatched ConfigNum %d", kv.gid, kv.me, args.GID, kv.curConfig.Num)
+	if args.ConfigNum < kv.curConfig.Num {
+		// if the config has already move on, means we have deleted this data
+		reply.Deleted = true
+		return
+	} else if args.ConfigNum > kv.curConfig.Num {
 		reply.Deleted = false
 		return
 	}
@@ -267,7 +297,7 @@ func (kv *ShardKV) RequestDelete(args *RequestDeleteArgs, reply *RequestDeleteRe
 	// start to commit a delete log
 	log := DeleteDataLog{ kv.curConfig.Num, args.ShardID }
 	command := Command{ DELETEDATA, log }
-	_, _, isLeader := kv.rf.Start(command)
+	_, _, isLeader = kv.rf.Start(command)
 
 	if !isLeader {
 		reply.WrongLeader = true
@@ -302,32 +332,45 @@ func (kv *ShardKV) sendDeleteRequest(ShardID, ConfigNum int) {
 
 	to_gid := kv.preConfig.Shards[ShardID]
 	servers := kv.preConfig.Groups[to_gid]
+	lastLeader := kv.lastLeaderCache[to_gid]
 
 	kv.mu.Unlock()
 
 	for si := 0; si < len(servers); si++ {
-		server := kv.make_end(servers[si])
+		server := kv.make_end(servers[lastLeader])
 
 		var reply RequestDeleteReply
 		ok := server.Call("ShardKV.RequestDelete", &args, &reply)
-		// DPrintf("[%d-%d] send RequestData RPC args %v reply %v", kv.gid, kv.me, args, reply)
+		DPrintf("[%d-%d] send RequestDelete RPC args %v reply %v", kv.gid, kv.me, args, reply)
 	
 		if !ok {
+			kv.mu.Lock()
+			lastLeader = (lastLeader + 1) % len(servers)
+			kv.lastLeaderCache[to_gid] = lastLeader
+			kv.mu.Unlock()
 			continue
 		}
 
 		if reply.WrongLeader {
+			kv.mu.Lock()
+			lastLeader = (lastLeader + 1) % len(servers)
+			kv.lastLeaderCache[to_gid] = lastLeader
+			kv.mu.Unlock()
 			continue
 		}
 
 		kv.mu.Lock()
+		// recheck assumption
 		if ConfigNum != kv.curConfig.Num || kv.shard[args.ShardID].State != NOTIFYDELETE {
 			kv.mu.Unlock()
 			return
 		}
 
 		if reply.Deleted {
-			kv.shard[args.ShardID].State = VALID
+			// start a command to notify other followers that data has been deleted
+			log := ConfirmLog{ kv.curConfig.Num, args.ShardID }
+			kv.rf.Start(Command{ CONFIRMDELETE, log })
+			DPrintf("[%d-%d] start confirm delete %d", kv.gid, kv.me, args.ShardID)
 		}
 
 		kv.mu.Unlock()
@@ -339,6 +382,10 @@ func (kv *ShardKV) sendDeleteRequest(ShardID, ConfigNum int) {
 func (kv *ShardKV) dataDeleter() {
 	for kv.killed() == false {
 		time.Sleep(time.Millisecond * time.Duration(DataDeleteInterval))
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			continue
+		}
 
 		kv.mu.Lock()
 		for shardID := 0; shardID < shardctrler.NShards; shardID++ {
@@ -390,6 +437,23 @@ func (kv *ShardKV) configPuller() {
 	}
 }
 
+func (kv *ShardKV) logChecker() {
+	for kv.killed() == false {
+		time.Sleep(time.Millisecond * time.Duration(LogCheckingInterval))
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			continue
+		}
+
+		hasLog := kv.rf.CheckLogTerm()
+		if !hasLog {
+			log := EmptyLog{}
+			kv.rf.Start(Command{ EMPTY, log })
+			DPrintf("[%d-%d] start a empty log", kv.gid, kv.me)
+		}
+	}
+}
+
 func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	ch, exists := kv.commitChannel[msg.CommandIndex]
@@ -397,39 +461,45 @@ func (kv *ShardKV) applyOperation(msg *raft.ApplyMsg) {
 	command := C.Data.(Op)
 	shard := key2shard(command.Key)
 
-	switch command.Type {
-	case GET:
-		value, appear := kv.shard[shard].DB[command.Key]
-		// check whether i'm responsable to send the command back to channel
-		if command.KvID == kv.me && exists {
-			if !appear {
-				command.Value = ""
-			} else {
-				command.Value = value
+	if kv.curConfig.Num != command.ConfigNum {
+		command.Err = ErrTryAgain
+	} else if kv.shard[shard].State == INVALID || kv.shard[shard].State == WAITREQUEST {
+		// i'm no longer hold the data
+		command.Err = ErrWrongGroup
+	} else {
+		command.Err = OK
+		switch command.Type {
+		case GET:
+			value, appear := kv.shard[shard].DB[command.Key]
+			// check whether i'm responsable to send the command back to channel
+			if command.KvID == kv.me && exists {
+				if !appear {
+					command.Value = ""
+				} else {
+					command.Value = value
+				}
 			}
-		}
-	case APPEND:
-		value, appear := kv.shard[shard].DB[command.Key]
-		// first check whether we have applied this command
-		if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
-			if !appear {
+		case APPEND:
+			value, appear := kv.shard[shard].DB[command.Key]
+			// first check whether we have applied this command
+			if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
+				if !appear {
+					kv.shard[shard].DB[command.Key] = command.Value
+				} else {
+					kv.shard[shard].DB[command.Key] = value + command.Value
+				}
+			}
+			
+		case PUT:
+			if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
 				kv.shard[shard].DB[command.Key] = command.Value
-			} else {
-				kv.shard[shard].DB[command.Key] = value + command.Value
 			}
 		}
-		
-	case PUT:
-		if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
-			kv.shard[shard].DB[command.Key] = command.Value
-		}
-	}
-	// update commit Index
-	kv.commitIndex = msg.CommandIndex
 
-	// update the seqID to prevent duplicated operation
-	if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
-		kv.shard[shard].ClientSeq[command.ClientID] = command.SeqID
+		// update the seqID to prevent duplicated operation
+		if kv.shard[shard].ClientSeq[command.ClientID] < command.SeqID {
+			kv.shard[shard].ClientSeq[command.ClientID] = command.SeqID
+		}
 	}
 
 	kv.mu.Unlock()
@@ -475,9 +545,9 @@ func (kv *ShardKV) applyConfig(msg *raft.ApplyMsg) {
 	}
 	kv.preConfig = kv.curConfig
 	kv.curConfig = configLog.Config
-	DPrintf("[%d-%d] shard state %v", kv.gid, kv.me, kv.shard)
 	kv.updateShardStateL()
 	DPrintf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
+	// log.Printf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
 }
 
 func (kv *ShardKV) applyShardData(msg *raft.ApplyMsg) {
@@ -522,7 +592,28 @@ func (kv *ShardKV) applyDeleteData(msg *raft.ApplyMsg) {
 	kv.shard[deleteLog.ShardID].DB = make(map[string]string)
 	kv.shard[deleteLog.ShardID].ClientSeq = make(map[int64]int)
 	kv.shard[deleteLog.ShardID].State = INVALID
-	DPrintf("[%d-%d] delete shard data ShardID=%d", kv.gid, kv.me, deleteLog.ShardID)
+	DPrintf("[%d-%d] delete shard data ShardID=%d configNum=%d", kv.gid, kv.me, deleteLog.ShardID, kv.curConfig.Num)
+	// log.Printf("[%d-%d] delete shard data ShardID=%d configNum=%d", kv.gid, kv.me, deleteLog.ShardID, kv.curConfig.Num)
+}
+
+func (kv *ShardKV) applyConfirmDelete(msg *raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	C := msg.Command.(Command)
+	confirmLog := C.Data.(ConfirmLog)
+
+	if kv.curConfig.Num != confirmLog.ConfigNum {
+		return
+	}
+
+	if kv.shard[confirmLog.ShardID].State != NOTIFYDELETE {
+		return
+	}
+
+	DPrintf("[%d-%d] confirm delete data ShardID=%d configNum=%d", kv.gid, kv.me, confirmLog.ShardID, kv.curConfig.Num)
+	// log.Printf("[%d-%d] confirm delete data ShardID=%d configNum=%d", kv.gid, kv.me, confirmLog.ShardID, kv.curConfig.Num)
+	kv.shard[confirmLog.ShardID].State = VALID
 }
 
 func (kv *ShardKV) executor() {
@@ -541,7 +632,17 @@ func (kv *ShardKV) executor() {
 				kv.applyShardData(&msg)
 			case DELETEDATA:
 				kv.applyDeleteData(&msg)
+			case EMPTY:
+				// do nothing
+			case CONFIRMDELETE:
+				kv.applyConfirmDelete(&msg)
 			}
+
+			kv.mu.Lock()
+			// update commit Index
+			kv.commitIndex = msg.CommandIndex
+			kv.mu.Unlock()
+
 		} else if msg.SnapshotValid {
 			go kv.applySnapshot(msg.Snapshot, msg.SnapshotTerm, msg.SnapshotIndex)
 		}
@@ -554,13 +655,6 @@ func (kv *ShardKV) checkShardKeyL(key string) bool {
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	command := Op {
-		Type: GET,
-		Key: args.Key,
-		KvID: kv.me,
-		ClientID: args.ClientID,
-		SeqID: args.SeqID,
-	}
 
 	// before anything, check whether we are the leader
 	_, isLeader := kv.rf.GetState()
@@ -570,6 +664,15 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	
 	kv.mu.Lock()
+
+	command := Op {
+		Type: GET,
+		Key: args.Key,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+		ConfigNum : kv.curConfig.Num,
+	}
 
 	if kv.checkShardKeyL(args.Key) == false {
 		reply.Err = ErrWrongGroup
@@ -609,7 +712,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 
 	select {
 	case op := <- ch:
-		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+		if op.Err != OK {
+			reply.Err = op.Err
+		} else if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
 			reply.Err = ErrWrongLeader
 		} else {
 			reply.Value = op.Value
@@ -642,14 +747,6 @@ func (kv *ShardKV) GetChannelL(index int) chan Op {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	command := Op {
-		Type: args.Op,
-		Key: args.Key,
-		Value: args.Value,
-		KvID: kv.me,
-		ClientID: args.ClientID,
-		SeqID: args.SeqID,
-	}
 
 	// before anything, check whether we are the leader
 	_, isLeader := kv.rf.GetState()
@@ -659,6 +756,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
+
+	command := Op {
+		Type: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		KvID: kv.me,
+		ClientID: args.ClientID,
+		SeqID: args.SeqID,
+		ConfigNum : kv.curConfig.Num,
+	}
 
 	if kv.checkShardKeyL(args.Key) == false {
 		reply.Err = ErrWrongGroup
@@ -697,8 +804,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	select {
 	case op := <- ch:
-		// sanity check here
-		if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+		if op.Err != OK {
+			reply.Err = op.Err
+		} else if op.ClientID != args.ClientID || op.SeqID != args.SeqID {
+			// sanity check here
 			reply.Err = ErrWrongLeader
 		} else {
 			reply.Err = OK
@@ -734,7 +843,7 @@ func (kv *ShardKV) snapshotThread() {
 		if kv.rf.RaftStateSize() > threshold {
 			// start snapshot
 			kv.mu.Lock()
-			DPrintf("[%d-%d] startSnapshot index=%d", kv.gid, kv.me, kv.commitIndex)
+			// DPrintf("[%d-%d] startSnapshot index=%d", kv.gid, kv.me, kv.commitIndex)
 
 			// if we can do COW would be greater
 			w := new(bytes.Buffer)
@@ -833,6 +942,22 @@ func (kv *ShardKV) applySnapshot(snapshot []byte, snapshotTerm, snapshotIndex in
 	}
 }
 
+func (kv *ShardKV) debugger() {
+	// periodically log the informationn
+	for kv.killed() == false {
+		time.Sleep(1 * time.Second)
+		_, isLeader := kv.rf.GetState()
+		term := kv.rf.CheckLogTerm()
+		if !isLeader {
+			continue
+		}
+
+		index := kv.rf.GetLastLogIndex()
+		kv.mu.Lock()
+		log.Printf("[%d-%d] config %v shardState %v lastLogIndex %d curIndex %d logterm %v", kv.gid, kv.me, kv.curConfig, kv.shard, index, kv.commitIndex, term)
+		kv.mu.Unlock()
+	}
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -871,6 +996,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(ConfigLog{})
 	labgob.Register(ShardDataLog{})
 	labgob.Register(DeleteDataLog{})
+	labgob.Register(EmptyLog{})
+	labgob.Register(ConfirmLog{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -892,6 +1019,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.commitIndex = 0
 	kv.sc = shardctrler.MakeClerk(ctrlers)
 
+	kv.lastLeaderCache = make(map[int]int)
+
 	for i := range kv.shard {
 		kv.shard[i].DB = make(map[string]string)
 		kv.shard[i].ClientSeq = make(map[int64]int)
@@ -905,6 +1034,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.configPuller()
 	go kv.dataPuller()
 	go kv.dataDeleter()
+	go kv.logChecker()
+	go kv.debugger()
 
 	return kv
 }

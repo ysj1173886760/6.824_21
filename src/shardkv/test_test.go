@@ -613,12 +613,14 @@ func TestUnreliable2(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
+	fmt.Printf("reliable\n")
 	atomic.StoreInt32(&done, 1)
 	cfg.net.Reliable(true)
 	for i := 0; i < n; i++ {
 		<-ch
 	}
 
+	fmt.Printf("checking\n")
 	for i := 0; i < n; i++ {
 		check(t, ck, ka[i], va[i])
 	}
