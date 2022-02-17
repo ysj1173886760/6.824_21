@@ -1028,7 +1028,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.dataPuller()
 	go kv.dataDeleter()
 	go kv.logChecker()
-	go kv.debugger()
+	// go kv.debugger()
 
 	return kv
 }
