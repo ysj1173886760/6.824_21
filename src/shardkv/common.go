@@ -44,3 +44,34 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type RequestDataArgs struct {
+	ConfigNum	int
+	ShardID 	int
+	
+	// for debugging
+	GID 		int
+}
+
+type RequestDataReply struct {
+	Valid 		bool
+	DB 			map[string]string
+	ClientSeq 	map[int64]int
+
+	// for debugging
+	GID 		int
+}
+
+type RequestDeleteArgs struct {
+	ShardID 	int
+	ConfigNum 	int
+
+	GID 		int
+}
+
+type RequestDeleteReply struct {
+	Deleted 	bool
+	WrongLeader bool
+
+	GID 		int
+}

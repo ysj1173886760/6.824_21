@@ -82,6 +82,7 @@ func (ck *Clerk) Get(key string) string {
 	args.ClientID = ck.ID
 	args.SeqID = ck.SeqID
 
+	DPrintf("[%d] start Get args=%v", ck.ID, args)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -132,6 +133,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.ClientID = ck.ID
 	args.SeqID = ck.SeqID
 
+	DPrintf("[%d] start PutAppend args=%v", ck.ID, args)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
