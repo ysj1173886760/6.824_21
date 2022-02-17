@@ -36,3 +36,20 @@
 
 所以我们还需要一个状态表示当成功apply了以后，这个数据是需要去告知原group我们apply成功的。但是为什么需要一个状态呢？我们难道不能在提交的时候就去RPC告诉原group我们成功了吗？其实不能，和上面的原因相同，删除数据是需要组内同步的一个操作，所以需要commit，但是由于commit不确定会成功，所以需要一个daemon去重试。直到我们确定了数据已经被删除为止。
 
+当确定数据被删除了以后，我们就可以提交一个确认删除的log，从而让当前raft group的这个shard完成配置过渡
+
+通过状态机来表示一下上面说到的思路
+
+![20220217210829](https://picsheep.oss-cn-beijing.aliyuncs.com/pic/20220217210829.png)
+
+当服务器是在serving的状态中，每个shard是valid或者invalid，表示当前服务器负责这个shard或者不负责这个shard
+
+当我们pull到了新的config的时候，就会尝试提交。config提交时就会应用到服务器中，这时我们就进入了配置过渡的状态。每个shard根据自己的情况，可能变成Wait Request状态，或者变成Request Data状态
+
+这时后台线程就负责去请求shard数据，RequestData状态的shard就会通过RequestData RPC来请求数据，并commit这个数据。当数据成功apply到服务器中时，他就会转换到notify delete状态，表示要告知原服务器删除这个shard的数据。
+
+WaitRequest的shard则等待notify delete状态的shard向自己发送RequestDelete RPC，并提交删除数据的log。当成功apply时，他就会删除数据并转化为invalid的状态。
+
+notify delete状态的shard会不断尝试RPC，直到他发现目标地点的数据已经被删除了（apply了log），他就会返回并提交一个确认删除的log，当log apply时，就会从notify delete状态转化为valid的状态。
+
+由于我们需要每个节点的数据都是一致的，所以涉及到状态的变更这些操作都需要通过log达成共识
