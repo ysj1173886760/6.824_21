@@ -16,8 +16,8 @@ const Debug = false
 
 const CommonInterval = 10
 const ConfigPullInterval = 100
-const DataPullInterval = 300
-const DataDeleteInterval = 300
+const DataPullInterval = 200
+const DataDeleteInterval = 200
 const LogCheckingInterval = 300
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -107,7 +107,7 @@ func (s Shard) String() string {
 }
 
 type ShardKV struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -116,9 +116,6 @@ type ShardKV struct {
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 	dead		 int32
-
-	// gid -> lastLeader
-	lastLeaderCache 	map[int]int
 	
 	// shardController
 	sc      	*shardctrler.Clerk
@@ -137,8 +134,8 @@ type ShardKV struct {
 // RPC related
 
 func (kv *ShardKV) RequestData(args *RequestDataArgs, reply *RequestDataReply) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
 
 	reply.GID = kv.gid
 	if args.ConfigNum != kv.curConfig.Num {
@@ -162,18 +159,18 @@ func (kv *ShardKV) RequestData(args *RequestDataArgs, reply *RequestDataReply) {
 
 // args is for checking assumption
 func (kv *ShardKV) sendRequestData(ShardID, ConfigNum int) {
-	kv.mu.Lock()
+	kv.mu.RLock()
 
 	if ConfigNum != kv.curConfig.Num {
 		// DPrintf("[%d-%d] return due to unmatch configNum %d %d", kv.gid, kv.me, kv.curConfig.Num, ConfigNum)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	// means that data has already been pulled
 	if kv.shard[ShardID].State != REQUESTDATA {
 		// DPrintf("[%d-%d] return due to unmatch state %v", kv.gid, kv.me, kv.curConfig)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -185,7 +182,7 @@ func (kv *ShardKV) sendRequestData(ShardID, ConfigNum int) {
 	to_gid := kv.preConfig.Shards[ShardID]
 	servers := kv.preConfig.Groups[to_gid]
 
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 
 	for si := 0; si < len(servers); si++ {
 		server := kv.make_end(servers[si])
@@ -204,9 +201,9 @@ func (kv *ShardKV) sendRequestData(ShardID, ConfigNum int) {
 
 		// if the data is valid, then we need to start a new command to commit this data
 		// hold on, before that, recheck the assumption
-		kv.mu.Lock()
+		kv.mu.RLock()
 		if ConfigNum != kv.curConfig.Num || kv.shard[args.ShardID].State != REQUESTDATA {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 
@@ -216,7 +213,7 @@ func (kv *ShardKV) sendRequestData(ShardID, ConfigNum int) {
 		kv.rf.Start(command)
 		// whether we are leader or not, we are going to exit this function. So we don't have to recheck it
 
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		break
 	}
 
@@ -226,13 +223,14 @@ func (kv *ShardKV) dataPuller() {
 	for kv.killed() == false {
 		time.Sleep(time.Millisecond * time.Duration(DataPullInterval))
 
-		kv.mu.Lock()
+		DPrintf("[%d-%d] dataPuller still working", kv.gid, kv.me)
+		kv.mu.RLock()
 		for shardID := 0; shardID < shardctrler.NShards; shardID++ {
 			if kv.shard[shardID].State == REQUESTDATA {
 				go kv.sendRequestData(shardID, kv.curConfig.Num)
 			}
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 	}
 }
 
@@ -275,9 +273,10 @@ func (kv *ShardKV) RequestDelete(args *RequestDeleteArgs, reply *RequestDeleteRe
 		return
 	}
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
 
+	DPrintf("[%d-%d] receive requestDelete RPC from %d shard=%d configNum=%d", kv.gid, kv.me, args.GID, args.ShardID, args.ConfigNum)
 	reply.GID = kv.gid
 	if args.ConfigNum < kv.curConfig.Num {
 		// if the config has already move on, means we have deleted this data
@@ -310,18 +309,18 @@ func (kv *ShardKV) RequestDelete(args *RequestDeleteArgs, reply *RequestDeleteRe
 
 // args is for checking assumption
 func (kv *ShardKV) sendDeleteRequest(ShardID, ConfigNum int) {
-	kv.mu.Lock()
+	kv.mu.RLock()
 
 	if ConfigNum != kv.curConfig.Num {
 		// DPrintf("[%d-%d] return due to unmatch configNum %d %d", kv.gid, kv.me, kv.curConfig.Num, ConfigNum)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
 	// means that data has already been pulled
 	if kv.shard[ShardID].State != NOTIFYDELETE {
 		// DPrintf("[%d-%d] return due to unmatch state %v", kv.gid, kv.me, kv.curConfig)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		return
 	}
 
@@ -332,37 +331,28 @@ func (kv *ShardKV) sendDeleteRequest(ShardID, ConfigNum int) {
 
 	to_gid := kv.preConfig.Shards[ShardID]
 	servers := kv.preConfig.Groups[to_gid]
-	lastLeader := kv.lastLeaderCache[to_gid]
 
-	kv.mu.Unlock()
+	kv.mu.RUnlock()
 
 	for si := 0; si < len(servers); si++ {
-		server := kv.make_end(servers[lastLeader])
+		server := kv.make_end(servers[si])
 
 		var reply RequestDeleteReply
 		ok := server.Call("ShardKV.RequestDelete", &args, &reply)
 		DPrintf("[%d-%d] send RequestDelete RPC args %v reply %v", kv.gid, kv.me, args, reply)
 	
 		if !ok {
-			kv.mu.Lock()
-			lastLeader = (lastLeader + 1) % len(servers)
-			kv.lastLeaderCache[to_gid] = lastLeader
-			kv.mu.Unlock()
 			continue
 		}
 
 		if reply.WrongLeader {
-			kv.mu.Lock()
-			lastLeader = (lastLeader + 1) % len(servers)
-			kv.lastLeaderCache[to_gid] = lastLeader
-			kv.mu.Unlock()
 			continue
 		}
 
-		kv.mu.Lock()
+		kv.mu.RLock()
 		// recheck assumption
 		if ConfigNum != kv.curConfig.Num || kv.shard[args.ShardID].State != NOTIFYDELETE {
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 			return
 		}
 
@@ -373,7 +363,7 @@ func (kv *ShardKV) sendDeleteRequest(ShardID, ConfigNum int) {
 			DPrintf("[%d-%d] start confirm delete %d", kv.gid, kv.me, args.ShardID)
 		}
 
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 		break
 	}
 
@@ -387,13 +377,15 @@ func (kv *ShardKV) dataDeleter() {
 			continue
 		}
 
-		kv.mu.Lock()
+		DPrintf("[%d-%d] dataDeleter still working", kv.gid, kv.me)
+		kv.mu.RLock()
 		for shardID := 0; shardID < shardctrler.NShards; shardID++ {
 			if kv.shard[shardID].State == NOTIFYDELETE {
+				DPrintf("[%d-%d] detect %d need to delete, spawn goroutine configNum %d", kv.gid, kv.me, shardID, kv.curConfig.Num)
 				go kv.sendDeleteRequest(shardID, kv.curConfig.Num)
 			}
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 	}
 }
 
@@ -420,10 +412,10 @@ func (kv *ShardKV) configPuller() {
 		if !isLeader {
 			continue
 		}
-		kv.mu.Lock()
+		kv.mu.RLock()
 		currentConfigNum := kv.curConfig.Num
 		shouldPullConfig := kv.checkCanPullConfigL()
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 
 		if shouldPullConfig {
 			config := kv.sc.Query(currentConfigNum + 1)
@@ -548,6 +540,8 @@ func (kv *ShardKV) applyConfig(msg *raft.ApplyMsg) {
 	kv.updateShardStateL()
 	DPrintf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
 	// log.Printf("[%d-%d] commit new config %v", kv.gid, kv.me, kv.curConfig)
+	// update commit Index
+	kv.commitIndex = msg.CommandIndex
 }
 
 func (kv *ShardKV) applyShardData(msg *raft.ApplyMsg) {
@@ -571,7 +565,9 @@ func (kv *ShardKV) applyShardData(msg *raft.ApplyMsg) {
 	kv.shard[dataLog.ShardID].DB = DuplicateDB(dataLog.DB)
 	kv.shard[dataLog.ShardID].ClientSeq = DuplicateClientSeq(dataLog.ClientSeq)
 	kv.shard[dataLog.ShardID].State = NOTIFYDELETE
-	DPrintf("[%d-%d] applied shard data ShardID=%d", kv.gid, kv.me, dataLog.ShardID)
+	DPrintf("[%d-%d] applied shard data ShardID=%d configNum=%d", kv.gid, kv.me, dataLog.ShardID, dataLog.ConfigNum)
+	// update commit Index
+	kv.commitIndex = msg.CommandIndex
 }
 
 func (kv *ShardKV) applyDeleteData(msg *raft.ApplyMsg) {
@@ -594,6 +590,8 @@ func (kv *ShardKV) applyDeleteData(msg *raft.ApplyMsg) {
 	kv.shard[deleteLog.ShardID].State = INVALID
 	DPrintf("[%d-%d] delete shard data ShardID=%d configNum=%d", kv.gid, kv.me, deleteLog.ShardID, kv.curConfig.Num)
 	// log.Printf("[%d-%d] delete shard data ShardID=%d configNum=%d", kv.gid, kv.me, deleteLog.ShardID, kv.curConfig.Num)
+	// update commit Index
+	kv.commitIndex = msg.CommandIndex
 }
 
 func (kv *ShardKV) applyConfirmDelete(msg *raft.ApplyMsg) {
@@ -614,6 +612,8 @@ func (kv *ShardKV) applyConfirmDelete(msg *raft.ApplyMsg) {
 	DPrintf("[%d-%d] confirm delete data ShardID=%d configNum=%d", kv.gid, kv.me, confirmLog.ShardID, kv.curConfig.Num)
 	// log.Printf("[%d-%d] confirm delete data ShardID=%d configNum=%d", kv.gid, kv.me, confirmLog.ShardID, kv.curConfig.Num)
 	kv.shard[confirmLog.ShardID].State = VALID
+	// update commit Index
+	kv.commitIndex = msg.CommandIndex
 }
 
 func (kv *ShardKV) executor() {
@@ -637,11 +637,6 @@ func (kv *ShardKV) executor() {
 			case CONFIRMDELETE:
 				kv.applyConfirmDelete(&msg)
 			}
-
-			kv.mu.Lock()
-			// update commit Index
-			kv.commitIndex = msg.CommandIndex
-			kv.mu.Unlock()
 
 		} else if msg.SnapshotValid {
 			go kv.applySnapshot(msg.Snapshot, msg.SnapshotTerm, msg.SnapshotIndex)
@@ -842,7 +837,7 @@ func (kv *ShardKV) snapshotThread() {
 		
 		if kv.rf.RaftStateSize() > threshold {
 			// start snapshot
-			kv.mu.Lock()
+			kv.mu.RLock()
 			// DPrintf("[%d-%d] startSnapshot index=%d", kv.gid, kv.me, kv.commitIndex)
 
 			// if we can do COW would be greater
@@ -854,7 +849,7 @@ func (kv *ShardKV) snapshotThread() {
 			e.Encode(kv.preConfig)
 			commitIndex := kv.commitIndex
 
-			kv.mu.Unlock()
+			kv.mu.RUnlock()
 
 			data := w.Bytes()
 			kv.rf.Snapshot(commitIndex, data)
@@ -953,9 +948,9 @@ func (kv *ShardKV) debugger() {
 		}
 
 		index := kv.rf.GetLastLogIndex()
-		kv.mu.Lock()
+		kv.mu.RLock()
 		log.Printf("[%d-%d] config %v shardState %v lastLogIndex %d curIndex %d logterm %v", kv.gid, kv.me, kv.curConfig, kv.shard, index, kv.commitIndex, term)
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 	}
 }
 
@@ -1018,8 +1013,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.commitChannel = make(map[int]chan Op)
 	kv.commitIndex = 0
 	kv.sc = shardctrler.MakeClerk(ctrlers)
-
-	kv.lastLeaderCache = make(map[int]int)
 
 	for i := range kv.shard {
 		kv.shard[i].DB = make(map[string]string)

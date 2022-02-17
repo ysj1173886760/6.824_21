@@ -15,6 +15,7 @@ import "6.824/shardctrler"
 import "time"
 
 const RetryCount = 3
+const RetryInterval = 30
 
 //
 // which shard is a key in?
@@ -92,6 +93,7 @@ func (ck *Clerk) Get(key string) string {
 				for cnt := 0; cnt < RetryCount; cnt++ {
 					srv := ck.make_end(servers[si])
 					var reply GetReply
+					// log.Printf("[%d] Get request to %v", ck.ID, servers[si])
 					ok := srv.Call("ShardKV.Get", &args, &reply)
 					if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 						return reply.Value
@@ -108,6 +110,8 @@ func (ck *Clerk) Get(key string) string {
 						// we retry this operation
 					}
 					// ... not ok
+					// retry 
+					time.Sleep(time.Millisecond * time.Duration(RetryInterval))
 				}
 			}
 		}
@@ -142,6 +146,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				for cnt := 0; cnt < RetryCount; cnt++ {
 					srv := ck.make_end(servers[si])
 					var reply PutAppendReply
+					// log.Printf("[%d] PutAppend request to %v", ck.ID, servers[si])
 					ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 					if ok && reply.Err == OK {
 						return
@@ -158,6 +163,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 						// we retry this operation
 					}
 					// ... not ok
+					time.Sleep(time.Millisecond * time.Duration(RetryInterval))
 				}
 			}
 		}
